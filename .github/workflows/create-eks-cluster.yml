@@ -1,0 +1,82 @@
+name: Create EKS Cluster
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:  { required: true, type: string }
+      k8s_version:   { required: true, type: string }
+      node_count:    { required: true, type: string }
+      node_type:     { required: true, type: string }
+      port_context:  { required: true }
+
+jobs:
+  create-eks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Create EKS Terraform config
+        run: |
+          mkdir -p eks-clusters
+          cat > eks-clusters/${{ inputs.cluster_name }}.tf <<EOF
+          module "eks_${{ inputs.cluster_name }}" {
+            source          = "terraform-aws-modules/eks/aws"
+            version         = "~> 20.0"
+            cluster_name    = "${{ inputs.cluster_name }}"
+            cluster_version = "${{ inputs.k8s_version }}"
+            vpc_id          = "${{ secrets.VPC_ID }}"
+            subnet_ids      = ${{ secrets.SUBNET_IDS_JSON }}
+
+            eks_managed_node_groups = {
+              default = {
+                instance_types = ["${{ inputs.node_type }}"]
+                min_size       = 1
+                max_size       = 10
+                desired_size   = ${{ inputs.node_count }}
+              }
+            }
+          }
+          EOF
+
+      - name: Terraform Init & Apply
+        run: |
+          cd eks-clusters
+          terraform init
+          terraform apply -auto-approve
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Upsert EKS entity in Port
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    UPSERT
+          blueprint:    eks_cluster
+          identifier:   ${{ inputs.cluster_name }}
+          title:        ${{ inputs.cluster_name }}
+          properties: |-
+            {
+              "cluster_name": "${{ inputs.cluster_name }}",
+              "region":       "${{ secrets.AWS_REGION }}",
+              "k8s_version":  "${{ inputs.k8s_version }}",
+              "node_count":    ${{ inputs.node_count }},
+              "node_type":    "${{ inputs.node_type }}",
+              "status":       "ACTIVE"
+            }
+          relations: |-
+            { "account": "663324537746" }
+
+      - name: Report SUCCESS to Port
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    PATCH_RUN
+          runId:        ${{ fromJson(inputs.port_context).runId }}
+          status:       "SUCCESS"
+          summary:      "EKS cluster ${{ inputs.cluster_name }} created successfully"
