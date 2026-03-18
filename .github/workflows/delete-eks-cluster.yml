@@ -1,0 +1,45 @@
+name: Delete EKS Cluster
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name: { required: true, type: string }
+      port_context: { required: true }
+
+jobs:
+  delete-eks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Destroy
+        run: |
+          cd eks-clusters
+          terraform init
+          terraform destroy -auto-approve \
+            -target=module.eks_${{ inputs.cluster_name }}
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Delete entity from Port catalog
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    DELETE
+          blueprint:    eks_cluster
+          identifier:   ${{ inputs.cluster_name }}
+
+      - name: Report SUCCESS to Port
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    PATCH_RUN
+          runId:        ${{ fromJson(inputs.port_context).runId }}
+          status:       "SUCCESS"
+          summary:      "EKS cluster ${{ inputs.cluster_name }} deleted"
