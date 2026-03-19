@@ -2,52 +2,183 @@ name: Create EKS Cluster
 on:
   workflow_dispatch:
     inputs:
-      cluster_name:  { required: true, type: string }
-      k8s_version:   { required: true, type: string }
-      node_count:    { required: true, type: string }
-      node_type:     { required: true, type: string }
-      port_context:  { required: true }
+      cluster_name:
+        required: true
+        type: string
+        description: Name of the EKS cluster (lowercase, hyphens only)
+      k8s_version:
+        required: true
+        type: string
+        description: Kubernetes version
+      node_count:
+        required: true
+        type: string
+        description: Number of nodes
+      node_type:
+        required: true
+        type: string
+        description: EC2 instance type for nodes
+      port_context:
+        required: true
+        description: Port run context
 
 jobs:
   create-eks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.SUBNET_IDS_JSON }}" ]; then
+            echo "ERROR: SUBNET_IDS_JSON secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.VPC_ID }}" ]; then
+            echo "ERROR: VPC_ID secret is not set"
+            exit 1
+          fi
+
+      - name: Notify Port — starting
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ fromJson(inputs.port_context).runId }}
+          logMessage: "Starting EKS cluster creation for ${{ inputs.cluster_name }} 🚀"
+
       - uses: hashicorp/setup-terraform@v3
 
       - name: Create EKS Terraform config
         run: |
           mkdir -p eks-clusters
-          cat > eks-clusters/${{ inputs.cluster_name }}.tf <<EOF
-          module "eks_${{ inputs.cluster_name }}" {
+          python3 - <<'PYEOF'
+          import os
+
+          cluster_name = "${{ inputs.cluster_name }}"
+          k8s_version  = "${{ inputs.k8s_version }}"
+          node_count   = "${{ inputs.node_count }}"
+          node_type    = "${{ inputs.node_type }}"
+          vpc_id       = "${{ secrets.VPC_ID }}"
+          subnet_ids   = '${{ secrets.SUBNET_IDS_JSON }}'
+
+          content = f'''terraform {{
+            required_providers {{
+              aws = {{
+                source  = "hashicorp/aws"
+                version = "~> 5.0"
+              }}
+            }}
+            backend "s3" {{
+              bucket = "damian-terraform-state"
+              key    = "eks-clusters/terraform.tfstate"
+              region = "ap-southeast-2"
+            }}
+          }}
+
+          provider "aws" {{
+            region = "ap-southeast-2"
+          }}
+
+          module "eks_{cluster_name}" {{
             source          = "terraform-aws-modules/eks/aws"
             version         = "~> 20.0"
-            cluster_name    = "${{ inputs.cluster_name }}"
-            cluster_version = "${{ inputs.k8s_version }}"
-            vpc_id          = "${{ secrets.VPC_ID }}"
-            subnet_ids      = ${{ secrets.SUBNET_IDS_JSON }}
-            
+            cluster_name    = "{cluster_name}"
+            cluster_version = "{k8s_version}"
+            vpc_id          = "{vpc_id}"
+            subnet_ids      = {subnet_ids}
+
             cluster_endpoint_public_access  = true
             cluster_endpoint_private_access = true
 
             enable_cluster_creator_admin_permissions = true
 
-            eks_managed_node_groups = {
-              default = {
-                instance_types = ["${{ inputs.node_type }}"]
+            access_entries = {{
+              root = {{
+                principal_arn = "arn:aws:iam::663324537746:root"
+                policy_associations = {{
+                  admin = {{
+                    policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+                    access_scope = {{
+                      type = "cluster"
+                    }}
+                  }}
+                }}
+              }}
+            }}
+
+            eks_managed_node_groups = {{
+              default = {{
+                instance_types = ["{node_type}"]
                 min_size       = 1
                 max_size       = 10
-                desired_size   = ${{ inputs.node_count }}
-              }
-            }
-          }
-          EOF
+                desired_size   = {node_count}
+                subnet_ids     = {subnet_ids}
+              }}
+            }}
+          }}
 
-      - name: Terraform Init & Apply
+          output "cluster_endpoint_{cluster_name}" {{
+            value = module.eks_{cluster_name}.cluster_endpoint
+          }}
+
+          output "cluster_name_{cluster_name}" {{
+            value = module.eks_{cluster_name}.cluster_name
+          }}
+          '''
+
+          with open(f"eks-clusters/{cluster_name}.tf", "w") as f:
+              f.write(content)
+
+          print(f"Generated eks-clusters/{cluster_name}.tf")
+          print(content)
+          PYEOF
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: eks-clusters
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Plan
+        run: terraform plan
+        working-directory: eks-clusters
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Notify Port — provisioning
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ fromJson(inputs.port_context).runId }}
+          logMessage: "Terraform plan complete — provisioning EKS cluster ${{ inputs.cluster_name }} ⏳"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: eks-clusters
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Get cluster endpoint
+        id: endpoint
         run: |
-          cd eks-clusters
-          terraform init
-          terraform apply -auto-approve
+          ENDPOINT=$(aws eks describe-cluster \
+            --name ${{ inputs.cluster_name }} \
+            --query 'cluster.endpoint' \
+            --output text)
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "Cluster endpoint: $ENDPOINT"
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -66,11 +197,13 @@ jobs:
           properties: |-
             {
               "cluster_name": "${{ inputs.cluster_name }}",
-              "region":       "${{ secrets.AWS_REGION }}",
+              "region":       "ap-southeast-2",
               "k8s_version":  "${{ inputs.k8s_version }}",
               "node_count":    ${{ inputs.node_count }},
               "node_type":    "${{ inputs.node_type }}",
-              "status":       "ACTIVE"
+              "status":       "ACTIVE",
+              "endpoint":     "${{ steps.endpoint.outputs.endpoint }}",
+              "created_at":   "${{ github.event.head_commit.timestamp }}"
             }
           relations: |-
             { "account": "663324537746" }
@@ -84,4 +217,16 @@ jobs:
           operation:    PATCH_RUN
           runId:        ${{ fromJson(inputs.port_context).runId }}
           status:       "SUCCESS"
-          summary:      "EKS cluster ${{ inputs.cluster_name }} created successfully"
+          summary:      "EKS cluster ${{ inputs.cluster_name }} created successfully 🎉"
+
+      - name: Report FAILURE to Port
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    PATCH_RUN
+          runId:        ${{ fromJson(inputs.port_context).runId }}
+          status:       "FAILURE"
+          summary:      "Failed to create EKS cluster ${{ inputs.cluster_name }} ❌"
