@@ -111,9 +111,10 @@ jobs:
 
             eks_managed_node_groups = {{
               default = {{
+                name           = "default"
                 instance_types = ["{node_type}"]
                 min_size       = 1
-                max_size       = 10
+                max_size       = 3
                 desired_size   = {node_count}
                 subnet_ids     = {subnet_ids}
               }}
