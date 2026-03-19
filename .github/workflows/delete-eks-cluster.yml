@@ -2,28 +2,128 @@ name: Delete EKS Cluster
 on:
   workflow_dispatch:
     inputs:
-      cluster_name: { required: true, type: string }
-      port_context: { required: true }
+      cluster_name:
+        required: true
+        type: string
+        description: Name of the EKS cluster to delete
+      port_context:
+        required: true
+        description: Port run context
 
 jobs:
   delete-eks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - name: Notify Port — starting
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ fromJson(inputs.port_context).runId }}
+          logMessage: "Starting deletion of EKS cluster ${{ inputs.cluster_name }} 🗑️"
 
-      - name: Terraform Destroy
+      - name: Get node group name
+        id: nodegroup
         run: |
-          cd eks-clusters
-          terraform init
-          terraform destroy -auto-approve \
-            -target=module.eks_${{ inputs.cluster_name }}
+          NODE_GROUP=$(aws eks list-nodegroups \
+            --cluster-name ${{ inputs.cluster_name }} \
+            --query 'nodegroups[0]' \
+            --output text)
+          echo "name=$NODE_GROUP" >> $GITHUB_OUTPUT
+          echo "Node group found: $NODE_GROUP"
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
 
-      - name: Delete entity from Port catalog
+      - name: Notify Port — deleting node group
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ fromJson(inputs.port_context).runId }}
+          logMessage: "Deleting node group ${{ steps.nodegroup.outputs.name }} ⏳"
+
+      - name: Delete node group
+        run: |
+          if [ "${{ steps.nodegroup.outputs.name }}" == "None" ] || [ -z "${{ steps.nodegroup.outputs.name }}" ]; then
+            echo "No node group found, skipping node group deletion"
+          else
+            aws eks delete-nodegroup \
+              --cluster-name ${{ inputs.cluster_name }} \
+              --nodegroup-name ${{ steps.nodegroup.outputs.name }}
+            echo "Node group deletion initiated"
+          fi
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Wait for node group deletion
+        run: |
+          echo "Waiting for node group to be deleted..."
+          aws eks wait nodegroup-deleted \
+            --cluster-name ${{ inputs.cluster_name }} \
+            --nodegroup-name ${{ steps.nodegroup.outputs.name }}
+          echo "Node group deleted successfully"
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Notify Port — deleting cluster
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.port.io
+          operation: PATCH_RUN
+          runId: ${{ fromJson(inputs.port_context).runId }}
+          logMessage: "Node group deleted — deleting EKS cluster ${{ inputs.cluster_name }} ⏳"
+
+      - name: Delete EKS cluster
+        run: |
+          aws eks delete-cluster --name ${{ inputs.cluster_name }}
+          echo "Cluster deletion initiated"
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Wait for cluster deletion
+        run: |
+          echo "Waiting for cluster to be deleted..."
+          aws eks wait cluster-deleted \
+            --name ${{ inputs.cluster_name }}
+          echo "Cluster deleted successfully"
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+      - name: Clean up Terraform state
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ORG_ADMIN_TOKEN }}
+
+      - name: Remove Terraform file and update state
+        run: |
+          if [ -f "eks-clusters/${{ inputs.cluster_name }}.tf" ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git rm eks-clusters/${{ inputs.cluster_name }}.tf
+            git commit -m "Remove EKS cluster ${{ inputs.cluster_name }} terraform config"
+            git push
+            echo "Terraform file removed"
+          else
+            echo "No Terraform file found for ${{ inputs.cluster_name }}"
+          fi
+
+      - name: Delete Port entity
         uses: port-labs/port-github-action@v1
         with:
           clientId:     ${{ secrets.PORT_CLIENT_ID }}
@@ -42,4 +142,16 @@ jobs:
           operation:    PATCH_RUN
           runId:        ${{ fromJson(inputs.port_context).runId }}
           status:       "SUCCESS"
-          summary:      "EKS cluster ${{ inputs.cluster_name }} deleted"
+          summary:      "EKS cluster ${{ inputs.cluster_name }} deleted successfully 🗑️"
+
+      - name: Report FAILURE to Port
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId:     ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl:      https://api.port.io
+          operation:    PATCH_RUN
+          runId:        ${{ fromJson(inputs.port_context).runId }}
+          status:       "FAILURE"
+          summary:      "Failed to delete EKS cluster ${{ inputs.cluster_name }} ❌"
