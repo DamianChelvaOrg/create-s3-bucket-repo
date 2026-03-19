@@ -72,7 +72,7 @@ jobs:
               }}
             }}
             backend "s3" {{
-              bucket = "damian-terraform-state"
+              bucket = "damian-terraform-state007"
               key    = "eks-clusters/terraform.tfstate"
               region = "ap-southeast-2"
             }}
