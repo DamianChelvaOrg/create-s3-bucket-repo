@@ -50,6 +50,10 @@ jobs:
           logMessage: "Starting EKS cluster creation for ${{ inputs.cluster_name }} 🚀"
 
       - uses: hashicorp/setup-terraform@v3
+      
+      - name: Get current timestamp
+        id: timestamp
+        run: echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
 
       - name: Create EKS Terraform config
         run: |
@@ -204,7 +208,7 @@ jobs:
               "node_type":    "${{ inputs.node_type }}",
               "status":       "ACTIVE",
               "endpoint":     "${{ steps.endpoint.outputs.endpoint }}",
-              "created_at":   "${{ github.event.head_commit.timestamp }}"
+              "created_at":   "${{ steps.timestamp.outputs.timestamp }}"
             }
           relations: |-
             { "account": "663324537746" }
